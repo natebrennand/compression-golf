@@ -53,6 +53,10 @@
 //!   - RLE for event_type: Data sorted by event_id, not event_type, so runs are
 //!     short (avg 2.09, 67% length 1). RLE saves only 4.1% on raw data, and zstd
 //!     already achieves 25% ratio.
+//!   - Huffman encoding for event_type: Shannon entropy is 1.758 bits/symbol,
+//!     theoretical minimum 220KB. Current 4-bit + zstd achieves 223KB - already
+//!     within 1.5% of theoretical optimum. Huffman would give ~279KB raw, and
+//!     zstd can't compress it further since it's already entropy-coded.
 //!   - Frequency-ordered repo indices: Reordering repos by frequency (most common
 //!     first) improved index compression by 60KB (more values fit in smaller bytes),
 //!     but hurt TSV compression by 90KB (lost alphabetical prefix sharing). Net loss.
@@ -199,6 +203,34 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     eprintln!("  RLE savings:   {:>10} bytes ({:.1}%)",
         indices.len() as i64 - rle_bytes as i64,
         (1.0 - rle_bytes as f64 / indices.len() as f64) * 100.0);
+
+    // Entropy analysis (theoretical minimum bits)
+    let entropy: f64 = freq.iter()
+        .filter(|(_, _, c)| *c > 0)
+        .map(|(_, _, c)| {
+            let p = *c as f64 / total;
+            -p * p.log2()
+        })
+        .sum();
+    let entropy_bytes = (entropy * total) / 8.0;
+
+    // Simple Huffman estimate: assign bit lengths based on frequency
+    // Sort by frequency, assign codes using canonical Huffman-like approach
+    let mut huffman_bits = 0.0;
+    for (i, (_, _, count)) in freq.iter().enumerate() {
+        // Approximate bit length: ceil(log2(total/count)) but min 1
+        let p = *count as f64 / total;
+        let bits = if p >= 0.5 { 1.0 } else { (-p.log2()).ceil().min(8.0) };
+        huffman_bits += *count as f64 * bits;
+    }
+    let huffman_bytes = huffman_bits / 8.0;
+
+    eprintln!("\n=== Entropy Analysis (event_type) ===");
+    eprintln!("  Shannon entropy: {:.3} bits/symbol", entropy);
+    eprintln!("  Theoretical min: {:>10.0} bytes ({:.2} B/row)", entropy_bytes, entropy_bytes / total);
+    eprintln!("  Huffman estimate:{:>10.0} bytes ({:.2} B/row)", huffman_bytes, huffman_bytes / total);
+    eprintln!("  4-bit packing:   {:>10} bytes ({:.2} B/row)", (indices.len() + 1) / 2, 0.5);
+    eprintln!("  Current (zstd):  {:>10} bytes ({:.2} B/row)", 223132, 0.22);  // from debug output
 }
 
 fn print_repo_pair_idx_analysis(indices: &[u32]) {
