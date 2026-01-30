@@ -166,6 +166,108 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
         (1.0 - rle_bytes as f64 / indices.len() as f64) * 100.0);
 }
 
+fn print_repo_pair_idx_analysis(indices: &[u32]) {
+    if indices.is_empty() {
+        return;
+    }
+
+    let total = indices.len();
+    let total_f = total as f64;
+
+    // Frequency distribution
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for &idx in indices {
+        *counts.entry(idx).or_insert(0) += 1;
+    }
+
+    let unique_repos = counts.len();
+    let mut freq: Vec<(u32, usize)> = counts.into_iter().collect();
+    freq.sort_by(|a, b| b.1.cmp(&a.1));
+
+    eprintln!("\n=== Repo Pair Index Distribution ===");
+    eprintln!("  Unique repos used: {} (of {} in mapping)", unique_repos, indices.iter().max().unwrap_or(&0) + 1);
+    eprintln!("  Events per repo:   {:.2} avg", total_f / unique_repos as f64);
+
+    // Top 10 repos
+    eprintln!("\n  Top 10 repos by event count:");
+    for (i, (idx, count)) in freq.iter().take(10).enumerate() {
+        eprintln!("    {:>2}. idx={:<8} count={:<8} ({:.2}%)",
+            i + 1, idx, count, *count as f64 / total_f * 100.0);
+    }
+
+    // Frequency buckets
+    let repos_1_event = freq.iter().filter(|(_, c)| *c == 1).count();
+    let repos_2_10 = freq.iter().filter(|(_, c)| *c >= 2 && *c <= 10).count();
+    let repos_11_100 = freq.iter().filter(|(_, c)| *c >= 11 && *c <= 100).count();
+    let repos_101_plus = freq.iter().filter(|(_, c)| *c > 100).count();
+
+    eprintln!("\n  Repos by event count:");
+    eprintln!("    1 event:     {:>8} repos ({:.1}%)", repos_1_event, repos_1_event as f64 / unique_repos as f64 * 100.0);
+    eprintln!("    2-10:        {:>8} repos ({:.1}%)", repos_2_10, repos_2_10 as f64 / unique_repos as f64 * 100.0);
+    eprintln!("    11-100:      {:>8} repos ({:.1}%)", repos_11_100, repos_11_100 as f64 / unique_repos as f64 * 100.0);
+    eprintln!("    101+:        {:>8} repos ({:.1}%)", repos_101_plus, repos_101_plus as f64 / unique_repos as f64 * 100.0);
+
+    // Run-length analysis
+    let mut runs: Vec<usize> = Vec::new();
+    let mut current_run = 1usize;
+    for i in 1..indices.len() {
+        if indices[i] == indices[i - 1] {
+            current_run += 1;
+        } else {
+            runs.push(current_run);
+            current_run = 1;
+        }
+    }
+    runs.push(current_run);
+
+    let num_runs = runs.len();
+    let avg_run = total_f / num_runs as f64;
+    let max_run = *runs.iter().max().unwrap_or(&0);
+    let runs_of_1 = runs.iter().filter(|&&r| r == 1).count();
+
+    eprintln!("\n=== Run-Length Analysis (repo_pair_idx) ===");
+    eprintln!("  Total runs:    {:>10}", num_runs);
+    eprintln!("  Avg run len:   {:>10.2}", avg_run);
+    eprintln!("  Max run len:   {:>10}", max_run);
+    eprintln!("  Runs of 1:     {:>10} ({:.1}%)", runs_of_1, runs_of_1 as f64 / num_runs as f64 * 100.0);
+
+    // Delta analysis (consecutive differences)
+    let deltas: Vec<i64> = indices.windows(2)
+        .map(|w| w[1] as i64 - w[0] as i64)
+        .collect();
+
+    if !deltas.is_empty() {
+        let delta_min = *deltas.iter().min().unwrap();
+        let delta_max = *deltas.iter().max().unwrap();
+        let zeros = deltas.iter().filter(|&&d| d == 0).count();
+        let fits_i8 = deltas.iter().filter(|&&d| d >= -128 && d <= 127).count();
+        let fits_i16 = deltas.iter().filter(|&&d| d >= -32768 && d <= 32767).count();
+
+        eprintln!("\n=== Delta Analysis (repo_pair_idx) ===");
+        eprintln!("  Delta range:   {} to {}", delta_min, delta_max);
+        eprintln!("  Zero deltas:   {:>10} ({:.1}%) [same repo]", zeros, zeros as f64 / deltas.len() as f64 * 100.0);
+        eprintln!("  Fits in i8:    {:>10} ({:.1}%)", fits_i8, fits_i8 as f64 / deltas.len() as f64 * 100.0);
+        eprintln!("  Fits in i16:   {:>10} ({:.1}%)", fits_i16, fits_i16 as f64 / deltas.len() as f64 * 100.0);
+
+        // Estimate delta encoding size
+        let delta_bytes: usize = deltas.iter().map(|&d| {
+            if d >= -128 && d <= 127 { 1 }
+            else if d >= -32768 && d <= 32767 { 2 }
+            else { 4 }
+        }).sum();
+        eprintln!("  Delta estimate:{:>10} bytes (vs {} raw u32)", delta_bytes + 4, total * 4);
+    }
+
+    // Varint analysis for raw values
+    let varint_bytes: usize = indices.iter().map(|&v| {
+        if v < 128 { 1 }
+        else if v < 16384 { 2 }
+        else if v < 2097152 { 3 }
+        else { 4 }
+    }).sum();
+    eprintln!("\n  Varint estimate: {:>8} bytes (vs {} raw u32)", varint_bytes, total * 4);
+}
+
 fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_compressed_size: usize) {
     let num_rows = columns.event_type_indices.len();
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
@@ -270,6 +372,9 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_
 
     // Event type distribution and RLE analysis
     print_event_type_distribution(&columns.event_type_dict, &columns.event_type_indices);
+
+    // Repo pair index analysis
+    print_repo_pair_idx_analysis(&columns.repo_pair_indices);
     eprintln!();
 }
 
@@ -339,6 +444,7 @@ struct EncodedColumns {
 }
 
 /// Build TSV mapping table from events, returns (tsv_bytes, pair_to_idx mapping)
+/// Repos are sorted alphabetically for better zstd compression (shared prefixes).
 fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, HashMap<(u32, String), u32>) {
     // Collect unique (repo_id, repo_name) pairs
     let mut unique_pairs: Vec<(u32, String)> = events
@@ -348,7 +454,7 @@ fn build_mapping_table(events: &[(EventKey, EventValue)]) -> (Vec<u8>, HashMap<(
         .into_iter()
         .collect();
 
-    // Sort for deterministic ordering
+    // Sort alphabetically for better TSV compression (shared prefixes)
     unique_pairs.sort();
 
     // Build TSV and index mapping
