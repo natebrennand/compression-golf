@@ -76,6 +76,17 @@
 //!         - Total: 7.31 B/row vs current 6.10 B/row - 16.6% worse
 //!     Conclusion: zstd's prefix compression on alphabetical TSV beats FST, and
 //!     sequential indices compress better than scattered repo_ids.
+//!   - RSMarisa trie for repo names: Pure Rust port of marisa-trie (MARISA = Matching
+//!     Algorithm with Recursively Implemented StorAge). Tried storing repo names in a
+//!     static trie, then storing trie lookup indices per event.
+//!     - Built trie from 262K unique repo names using Keyset/Trie API
+//!     - Stored serialized trie in compressed payload (trie_size in header)
+//!     - Per event, stored u32 trie index from lookup()
+//!     - Result: 8,460,472 bytes (8.46 B/row)
+//!     - Switched to TSV mapping: 6,733,425 bytes (6.73 B/row) - 20% improvement
+//!     Conclusion: TSV + zstd beats trie because zstd already exploits alphabetical
+//!     prefix sharing in sorted TSV entries. The trie's space-efficient structure
+//!     doesn't help when the whole thing gets zstd-compressed anyway.
 //!
 //! Current results (1M events):
 //!   - event_type:       0.22 B/row (4-bit packed)
