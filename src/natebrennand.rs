@@ -31,7 +31,7 @@
 //!   Compressed payload (zstd-22):
 //!     - mapping TSV (repo_id\trepo_name\n)
 //!     - event_type dict (newline-separated strings)
-//!     - event_type indices: [u8; num_events]
+//!     - event_type indices: 4-bit packed [(num_events+1)/2 bytes]
 //!     - event_id deltas: [u8; num_events]
 //!     - repo_pair indices: [u32-le; num_events]
 //!     - created_at deltas: [i16-le; num_events]
@@ -41,8 +41,8 @@
 //!     fitting in u8. Compresses to 0.35 B/row.
 //!   - Delta encoding for timestamps: Correlated with event_id, deltas fit in i16
 //!     (99.9% fit in i8). Compresses to 0.04 B/row.
-//!   - Dictionary encoding for event_type: 15 unique values, u8 indices.
-//!     Compresses to 0.25 B/row.
+//!   - Dictionary encoding for event_type: 15 unique values, 4-bit packed indices
+//!     (2 per byte). Compresses to 0.22 B/row.
 //!   - TSV mapping table: Store unique (repo_id, repo_name) pairs once, reference
 //!     by u32 index per event. TSV compresses to 3.78 B/row.
 //!   - Alphabetical TSV ordering: Enables zstd to exploit shared prefixes in
@@ -64,12 +64,12 @@
 //!     only 26% fit in i16. Would use 3.47MB vs zstd's 2.32MB.
 //!
 //! Current results (1M events):
-//!   - event_type:       0.25 B/row
+//!   - event_type:       0.22 B/row (4-bit packed)
 //!   - event_id_delta:   0.35 B/row
 //!   - repo_pair_idx:    2.32 B/row
 //!   - created_at_delta: 0.04 B/row
 //!   - repo mapping TSV: 3.78 B/row
-//!   - TOTAL:            6.73 B/row
+//!   - TOTAL:            6.73 B/row (6,731,041 bytes)
 //!
 //! Set NATE_DEBUG=1 to see column size statistics.
 
@@ -304,7 +304,7 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
 }
 
 fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_compressed_size: usize) {
-    let num_rows = columns.event_type_indices.len();
+    let num_rows = columns.event_id_deltas.len();  // 1 per event
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
     eprintln!("Total rows: {}", num_rows);
     eprintln!("{:<20} {:>10} {:>10} {:>8} {:>10}", "Column", "Raw", "Zstd", "Ratio", "B/Row");
@@ -313,19 +313,19 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_
     let mut total_raw = 0usize;
     let mut total_compressed = 0usize;
 
-    // event_type (dict + indices)
+    // event_type (dict + 4-bit packed indices)
     let dict_raw = columns.event_type_dict.len();
-    let indices_raw = columns.event_type_indices.len();
-    let event_type_raw = dict_raw + indices_raw;
+    let packed_raw = columns.event_type_packed.len();
+    let event_type_raw = dict_raw + packed_raw;
     let mut event_type_buf = Vec::with_capacity(event_type_raw);
     event_type_buf.extend_from_slice(&columns.event_type_dict);
-    event_type_buf.extend_from_slice(&columns.event_type_indices);
+    event_type_buf.extend_from_slice(&columns.event_type_packed);
     let event_type_compressed = zstd::encode_all(event_type_buf.as_slice(), ZSTD_LEVEL).unwrap().len();
     total_raw += event_type_raw;
     total_compressed += event_type_compressed;
     eprintln!(
         "{:<20} {:>10} {:>10} {:>7.1}% {:>10.2}",
-        "event_type",
+        "event_type (4-bit)",
         event_type_raw,
         event_type_compressed,
         100.0 * event_type_compressed as f64 / event_type_raw as f64,
@@ -398,15 +398,16 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv_raw: usize, mapping_
         total_compressed as f64 / num_rows as f64
     );
 
-    // Value statistics
+    // Value statistics (unpack for analysis)
+    let event_type_indices = unpack_nibbles(&columns.event_type_packed, num_rows);
     eprintln!("\n=== Value Statistics ===");
-    print_value_stats_unsigned("event_type_idx", &columns.event_type_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
+    print_value_stats_unsigned("event_type_idx", &event_type_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
     print_value_stats_unsigned("event_id_delta", &columns.event_id_deltas.iter().map(|&v| v as u64).collect::<Vec<_>>());
     print_value_stats_unsigned("repo_pair_idx", &columns.repo_pair_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
     print_value_stats_signed("created_at_delta", &columns.created_at_deltas.iter().map(|&v| v as i64).collect::<Vec<_>>());
 
     // Event type distribution and RLE analysis
-    print_event_type_distribution(&columns.event_type_dict, &columns.event_type_indices);
+    print_event_type_distribution(&columns.event_type_dict, &event_type_indices);
 
     // Repo pair index analysis
     print_repo_pair_idx_analysis(&columns.repo_pair_indices);
@@ -472,10 +473,35 @@ impl Header {
 /// Holds the encoded column data before compression
 struct EncodedColumns {
     event_type_dict: Vec<u8>,       // newline-separated event type strings
-    event_type_indices: Vec<u8>,    // i8 indices as bytes
+    event_type_packed: Vec<u8>,     // 4-bit packed indices (2 per byte)
     event_id_deltas: Vec<u8>,       // u8 deltas
     repo_pair_indices: Vec<u32>,    // u32 indices
     created_at_deltas: Vec<i16>,    // i16 deltas
+}
+
+/// Pack 4-bit values into bytes (2 values per byte, low nibble first)
+fn pack_nibbles(values: &[u8]) -> Vec<u8> {
+    let mut packed = Vec::with_capacity((values.len() + 1) / 2);
+    for chunk in values.chunks(2) {
+        let byte = chunk[0] | (chunk.get(1).copied().unwrap_or(0) << 4);
+        packed.push(byte);
+    }
+    packed
+}
+
+/// Unpack 4-bit values from bytes
+fn unpack_nibbles(packed: &[u8], count: usize) -> Vec<u8> {
+    let mut values = Vec::with_capacity(count);
+    for &byte in packed {
+        values.push(byte & 0x0F);
+        if values.len() < count {
+            values.push(byte >> 4);
+        }
+        if values.len() >= count {
+            break;
+        }
+    }
+    values
 }
 
 /// Build TSV mapping table from events, returns (tsv_bytes, pair_to_idx mapping)
@@ -649,7 +675,7 @@ fn encode_events(events: &[(EventKey, EventValue)]) -> Result<(Header, Vec<u8>, 
 
     let columns = EncodedColumns {
         event_type_dict,
-        event_type_indices,
+        event_type_packed: pack_nibbles(&event_type_indices),
         event_id_deltas,
         repo_pair_indices,
         created_at_deltas,
@@ -739,7 +765,7 @@ impl EventCodec for NatebrennandCodec {
 
         let payload_size = mapping_tsv.len()
             + columns.event_type_dict.len()
-            + columns.event_type_indices.len()
+            + columns.event_type_packed.len()
             + columns.event_id_deltas.len()
             + repo_bytes.len()
             + ts_bytes.len();
@@ -747,7 +773,7 @@ impl EventCodec for NatebrennandCodec {
         let mut uncompressed = Vec::with_capacity(payload_size);
         uncompressed.extend_from_slice(&mapping_tsv);
         uncompressed.extend_from_slice(&columns.event_type_dict);
-        uncompressed.extend_from_slice(&columns.event_type_indices);
+        uncompressed.extend_from_slice(&columns.event_type_packed);
         uncompressed.extend_from_slice(&columns.event_id_deltas);
         uncompressed.extend_from_slice(&repo_bytes);
         uncompressed.extend_from_slice(&ts_bytes);
@@ -790,10 +816,12 @@ impl EventCodec for NatebrennandCodec {
             .map(|s| s.to_string())
             .collect();
 
-        // 3. Event type indices
+        // 3. Event type indices (4-bit packed, 2 per byte)
         let num_events = header.num_events as usize;
-        let event_type_indices = &decompressed[offset..offset + num_events];
-        offset += num_events;
+        let packed_size = (num_events + 1) / 2;
+        let event_type_packed = &decompressed[offset..offset + packed_size];
+        offset += packed_size;
+        let event_type_indices = unpack_nibbles(event_type_packed, num_events);
 
         // 4. Event ID deltas
         let event_id_deltas = &decompressed[offset..offset + num_events];
@@ -819,7 +847,7 @@ impl EventCodec for NatebrennandCodec {
             &header,
             &mapping,
             &event_type_dict,
-            event_type_indices,
+            &event_type_indices,
             event_id_deltas,
             &repo_pair_indices,
             &created_at_deltas,
