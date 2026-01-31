@@ -122,13 +122,32 @@
 
 use bytes::Bytes;
 use chrono::DateTime;
+use lzma_rust2::{LzmaOptions, LzmaReader, LzmaWriter};
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::{Read, Write};
 
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue, Repo};
 
-const ZSTD_LEVEL: i32 = 22;
+const LZMA_PRESET: u32 = 9; // Max compression
+const ZSTD_LEVEL: i32 = 22; // For debug functions
+
+fn lzma_compress(data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut output = Vec::new();
+    let options = LzmaOptions::with_preset(LZMA_PRESET);
+    let mut writer = LzmaWriter::new_use_header(&mut output, &options, Some(data.len() as u64))?;
+    writer.write_all(data)?;
+    writer.finish()?;
+    Ok(output)
+}
+
+fn lzma_decompress(data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut reader = LzmaReader::new_mem_limit(data, u32::MAX, None)?;
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    Ok(output)
+}
 
 /// Pack u32 values into 24-bit (3 byte) little-endian format
 fn pack_u24(values: &[u32]) -> Vec<u8> {
@@ -700,14 +719,14 @@ impl EventCodec for NatebrennandCodec {
         }
 
         // Compress each column separately (mapping split into IDs and names)
-        let mapping_ids_compressed = zstd::encode_all(mapping_ids.as_slice(), ZSTD_LEVEL)?;
-        let mapping_names_compressed = zstd::encode_all(mapping_names.as_slice(), ZSTD_LEVEL)?;
-        let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
-        let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
+        let mapping_ids_compressed = lzma_compress(&mapping_ids)?;
+        let mapping_names_compressed = lzma_compress(&mapping_names)?;
+        let dict_compressed = lzma_compress(&columns.event_type_dict)?;
+        let packed_compressed = lzma_compress(&columns.event_type_packed)?;
         let id_deltas_varint = encode_varint_u64(&columns.event_id_deltas);
-        let id_deltas_compressed = zstd::encode_all(id_deltas_varint.as_slice(), ZSTD_LEVEL)?;
-        let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)?;
-        let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)?;
+        let id_deltas_compressed = lzma_compress(&id_deltas_varint)?;
+        let repo_compressed = lzma_compress(&repo_bytes)?;
+        let ts_compressed = lzma_compress(&ts_bytes)?;
 
         // Build header with compressed sizes
         let header = Header {
@@ -800,13 +819,13 @@ impl EventCodec for NatebrennandCodec {
         let mapping_ids_compressed =
             &bytes[offset..offset + header.mapping_ids_compressed as usize];
         offset += header.mapping_ids_compressed as usize;
-        let mapping_ids_bytes = zstd::decode_all(mapping_ids_compressed)?;
+        let mapping_ids_bytes = lzma_decompress(mapping_ids_compressed)?;
 
         // 2. Mapping names (newline-separated)
         let mapping_names_compressed =
             &bytes[offset..offset + header.mapping_names_compressed as usize];
         offset += header.mapping_names_compressed as usize;
-        let mapping_names_bytes = zstd::decode_all(mapping_names_compressed)?;
+        let mapping_names_bytes = lzma_decompress(mapping_names_compressed)?;
 
         // Parse binary mapping table
         let mapping = parse_mapping_table(
@@ -818,7 +837,7 @@ impl EventCodec for NatebrennandCodec {
         // 3. Event type dictionary
         let dict_compressed = &bytes[offset..offset + header.dict_compressed as usize];
         offset += header.dict_compressed as usize;
-        let dict_bytes = zstd::decode_all(dict_compressed)?;
+        let dict_bytes = lzma_decompress(dict_compressed)?;
         let event_type_dict: Vec<String> = std::str::from_utf8(&dict_bytes)?
             .split('\n')
             .map(|s| s.to_string())
@@ -827,25 +846,25 @@ impl EventCodec for NatebrennandCodec {
         // 4. Event type indices (4-bit packed)
         let packed_compressed = &bytes[offset..offset + header.packed_compressed as usize];
         offset += header.packed_compressed as usize;
-        let packed_bytes = zstd::decode_all(packed_compressed)?;
+        let packed_bytes = lzma_decompress(packed_compressed)?;
         let num_events = header.num_events as usize;
         let event_type_indices = unpack_nibbles(&packed_bytes, num_events);
 
         // 5. Event ID deltas (varint encoded)
         let id_deltas_compressed = &bytes[offset..offset + header.id_deltas_compressed as usize];
         offset += header.id_deltas_compressed as usize;
-        let id_deltas_varint = zstd::decode_all(id_deltas_compressed)?;
+        let id_deltas_varint = lzma_decompress(id_deltas_compressed)?;
         let event_id_deltas = decode_varint_u64(&id_deltas_varint, num_events);
 
         // 6. Repo pair indices (24-bit packed)
         let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
         offset += header.repo_compressed as usize;
-        let repo_bytes = zstd::decode_all(repo_compressed)?;
+        let repo_bytes = lzma_decompress(repo_compressed)?;
         let repo_pair_indices = unpack_u24(&repo_bytes, num_events);
 
         // 7. Created at deltas (varint encoded)
         let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
-        let ts_bytes = zstd::decode_all(ts_compressed)?;
+        let ts_bytes = lzma_decompress(ts_compressed)?;
         let created_at_deltas = decode_varint_i16(&ts_bytes, num_events);
 
         // Decode events
