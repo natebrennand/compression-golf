@@ -10,6 +10,7 @@ mod hachikuji;
 mod jakedgy;
 mod naive;
 mod natebrennand;
+mod natebrennand_arrow;
 mod samsond;
 mod xiangpenghao;
 mod zstd;
@@ -21,6 +22,7 @@ use hachikuji::HachikujiCodec;
 use jakedgy::JakedgyCodec;
 use naive::NaiveCodec;
 use natebrennand::NatebrennandCodec;
+use natebrennand_arrow::NateBrennandArrowCodec;
 use samsond::SamsondCodec;
 use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
@@ -194,6 +196,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Box::new(SamsondCodec::new()), &events),
         (Box::new(JakedgyCodec::new()), &sorted_events),
         (Box::new(NatebrennandCodec::new()), &sorted_events),
+        (Box::new(NateBrennandArrowCodec::new()), &sorted_events),
     ];
 
     for (codec, expected) in codecs {
