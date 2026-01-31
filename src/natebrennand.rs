@@ -487,7 +487,7 @@ fn parse_mapping_table(id_bytes: &[u8], names_bytes: &[u8], num_entries: usize) 
 
     // Combine into pairs
     ids.into_iter()
-        .zip(names.into_iter())
+        .zip(names)
         .map(|(id, name)| (id, name.to_string()))
         .collect()
 }
@@ -848,6 +848,7 @@ impl EventCodec for NatebrennandCodec {
 // Debug and analysis functions (enabled with NATE_DEBUG=1)
 // ============================================================================
 
+#[allow(dead_code)]
 /// Compress with custom zstd parameters
 fn compress_with_params(data: &[u8], level: i32, window_log: Option<u32>, pledged_size: bool, checksum: bool) -> Vec<u8> {
     use std::io::Write;
@@ -893,6 +894,7 @@ fn pack_bits(values: &[u32], bits_per_value: u32) -> Vec<u8> {
     result
 }
 
+#[allow(dead_code)]
 /// Experiment with delta encoding repo_ids in mapping table
 fn experiment_mapping_formats(mapping_tsv: &[u8]) {
     eprintln!("\n=== Mapping Format Experiment ===");
@@ -978,6 +980,7 @@ fn experiment_mapping_formats(mapping_tsv: &[u8]) {
         binary_alpha_total, binary_alpha_total as i64 - current_compressed as i64);
 }
 
+#[allow(dead_code)]
 /// Experiment with variable-width timestamp deltas
 fn experiment_timestamp_encoding(deltas: &[i16]) {
     eprintln!("\n=== Timestamp Delta Encoding Experiment ===");
@@ -1043,6 +1046,7 @@ fn experiment_timestamp_encoding(deltas: &[i16]) {
         varint_compressed.len() as i64 - i16_compressed.len() as i64);
 }
 
+#[allow(dead_code)]
 /// Experiment with bit-packing repo indices
 fn experiment_repo_bit_packing(repo_indices: &[u32]) {
     eprintln!("\n=== Repo Index Bit-Packing Experiment ===");
@@ -1077,6 +1081,7 @@ fn experiment_repo_bit_packing(repo_indices: &[u32]) {
     }
 }
 
+#[allow(dead_code)]
 /// Experiment with different zstd compression approaches
 fn experiment_compression_strategies(
     mapping_tsv: &[u8],
@@ -1185,6 +1190,7 @@ fn debug_enabled() -> bool {
     std::env::var("NATE_DEBUG").is_ok()
 }
 
+#[allow(dead_code)]
 /// Print value statistics for a column: min, max, and % fitting in each bit width
 fn print_value_stats_unsigned(name: &str, values: &[u64]) {
     if values.is_empty() {
@@ -1203,6 +1209,7 @@ fn print_value_stats_unsigned(name: &str, values: &[u64]) {
     );
 }
 
+#[allow(dead_code)]
 fn print_value_stats_signed(name: &str, values: &[i64]) {
     if values.is_empty() {
         return;
@@ -1220,6 +1227,7 @@ fn print_value_stats_signed(name: &str, values: &[i64]) {
     );
 }
 
+#[allow(dead_code)]
 fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     // Parse dictionary
     let dict_str = std::str::from_utf8(dict).unwrap();
@@ -1317,6 +1325,7 @@ fn print_event_type_distribution(dict: &[u8], indices: &[u8]) {
     eprintln!("  Current (zstd):  {:>10} bytes ({:.2} B/row)", 223132, 0.22);  // from debug output
 }
 
+#[allow(dead_code)]
 fn print_repo_pair_idx_analysis(indices: &[u32]) {
     if indices.is_empty() {
         return;
@@ -1419,6 +1428,7 @@ fn print_repo_pair_idx_analysis(indices: &[u32]) {
     eprintln!("\n  Varint estimate: {:>8} bytes (vs {} raw u32)", varint_bytes, total * 4);
 }
 
+#[allow(dead_code)]
 fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_compressed_size: usize) {
     let num_rows = columns.event_id_deltas.len();  // 1 per event
     eprintln!("\n=== Per-Column Compressed Size Estimates ===");
@@ -1520,7 +1530,7 @@ fn print_column_stats(columns: &EncodedColumns, mapping_tsv: &[u8], mapping_comp
     let event_type_indices = unpack_nibbles(&columns.event_type_packed, num_rows);
     eprintln!("\n=== Value Statistics ===");
     print_value_stats_unsigned("event_type_idx", &event_type_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
-    print_value_stats_unsigned("event_id_delta", &columns.event_id_deltas.iter().map(|&v| v as u64).collect::<Vec<_>>());
+    print_value_stats_unsigned("event_id_delta", &columns.event_id_deltas);
     print_value_stats_unsigned("repo_pair_idx", &columns.repo_pair_indices.iter().map(|&v| v as u64).collect::<Vec<_>>());
     print_value_stats_signed("created_at_delta", &columns.created_at_deltas.iter().map(|&v| v as i64).collect::<Vec<_>>());
 
