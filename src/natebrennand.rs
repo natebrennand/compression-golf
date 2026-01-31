@@ -120,15 +120,35 @@
 //!
 //! Set NATE_DEBUG=1 to see column size statistics and compression experiments.
 
+use brotli::{CompressorWriter, Decompressor};
 use bytes::Bytes;
 use chrono::DateTime;
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::{Read, Write};
 
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue, Repo};
 
-const ZSTD_LEVEL: i32 = 22;
+const ZSTD_LEVEL: i32 = 22; // For debug functions
+const BROTLI_QUALITY: u32 = 11; // Max quality (0-11)
+const BROTLI_LGWIN: u32 = 24; // Window size 2^24 = 16MB
+
+fn brotli_compress(data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut output = Vec::new();
+    {
+        let mut writer = CompressorWriter::new(&mut output, 4096, BROTLI_QUALITY, BROTLI_LGWIN);
+        writer.write_all(data)?;
+    }
+    Ok(output)
+}
+
+fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut decompressor = Decompressor::new(data, 4096);
+    let mut output = Vec::new();
+    decompressor.read_to_end(&mut output)?;
+    Ok(output)
+}
 
 /// Pack u32 values into 24-bit (3 byte) little-endian format
 fn pack_u24(values: &[u32]) -> Vec<u8> {
@@ -695,15 +715,47 @@ impl EventCodec for NatebrennandCodec {
             experiment_repo_bit_packing(&columns.repo_pair_indices);
         }
 
+        // Compare zstd vs brotli per column
+        if debug_enabled() {
+            let id_deltas_varint = encode_varint_u64(&columns.event_id_deltas);
+            eprintln!("\n=== Brotli vs Zstd Per-Column Comparison ===");
+            eprintln!("{:<20} {:>10} {:>10} {:>10}", "Column", "Zstd", "Brotli", "Diff");
+            eprintln!("{}", "-".repeat(54));
+
+            let columns_to_test: Vec<(&str, &[u8])> = vec![
+                ("mapping_ids", &mapping_ids),
+                ("mapping_names", &mapping_names),
+                ("event_type_dict", &columns.event_type_dict),
+                ("event_type_packed", &columns.event_type_packed),
+                ("id_deltas", &id_deltas_varint),
+                ("repo_indices", &repo_bytes),
+                ("ts_deltas", &ts_bytes),
+            ];
+
+            let mut total_zstd = 0usize;
+            let mut total_brotli = 0usize;
+            for (name, data) in &columns_to_test {
+                let zstd_size = zstd::encode_all(*data, ZSTD_LEVEL).unwrap().len();
+                let brotli_size = brotli_compress(data).unwrap().len();
+                let diff = brotli_size as i64 - zstd_size as i64;
+                total_zstd += zstd_size;
+                total_brotli += brotli_size;
+                eprintln!("{:<20} {:>10} {:>10} {:>+10}", name, zstd_size, brotli_size, diff);
+            }
+            eprintln!("{}", "-".repeat(54));
+            eprintln!("{:<20} {:>10} {:>10} {:>+10}", "TOTAL", total_zstd, total_brotli,
+                      total_brotli as i64 - total_zstd as i64);
+        }
+
         // Compress each column separately (mapping split into IDs and names)
-        let mapping_ids_compressed = zstd::encode_all(mapping_ids.as_slice(), ZSTD_LEVEL)?;
-        let mapping_names_compressed = zstd::encode_all(mapping_names.as_slice(), ZSTD_LEVEL)?;
-        let dict_compressed = zstd::encode_all(columns.event_type_dict.as_slice(), ZSTD_LEVEL)?;
-        let packed_compressed = zstd::encode_all(columns.event_type_packed.as_slice(), ZSTD_LEVEL)?;
+        let mapping_ids_compressed = brotli_compress(&mapping_ids)?;
+        let mapping_names_compressed = brotli_compress(&mapping_names)?;
+        let dict_compressed = brotli_compress(&columns.event_type_dict)?;
+        let packed_compressed = brotli_compress(&columns.event_type_packed)?;
         let id_deltas_varint = encode_varint_u64(&columns.event_id_deltas);
-        let id_deltas_compressed = zstd::encode_all(id_deltas_varint.as_slice(), ZSTD_LEVEL)?;
-        let repo_compressed = zstd::encode_all(repo_bytes.as_slice(), ZSTD_LEVEL)?;
-        let ts_compressed = zstd::encode_all(ts_bytes.as_slice(), ZSTD_LEVEL)?;
+        let id_deltas_compressed = brotli_compress(&id_deltas_varint)?;
+        let repo_compressed = brotli_compress(&repo_bytes)?;
+        let ts_compressed = brotli_compress(&ts_bytes)?;
 
         // Build header with compressed sizes
         let header = Header {
@@ -796,13 +848,13 @@ impl EventCodec for NatebrennandCodec {
         let mapping_ids_compressed =
             &bytes[offset..offset + header.mapping_ids_compressed as usize];
         offset += header.mapping_ids_compressed as usize;
-        let mapping_ids_bytes = zstd::decode_all(mapping_ids_compressed)?;
+        let mapping_ids_bytes = brotli_decompress(mapping_ids_compressed)?;
 
         // 2. Mapping names (newline-separated)
         let mapping_names_compressed =
             &bytes[offset..offset + header.mapping_names_compressed as usize];
         offset += header.mapping_names_compressed as usize;
-        let mapping_names_bytes = zstd::decode_all(mapping_names_compressed)?;
+        let mapping_names_bytes = brotli_decompress(mapping_names_compressed)?;
 
         // Parse binary mapping table
         let mapping = parse_mapping_table(
@@ -814,7 +866,7 @@ impl EventCodec for NatebrennandCodec {
         // 3. Event type dictionary
         let dict_compressed = &bytes[offset..offset + header.dict_compressed as usize];
         offset += header.dict_compressed as usize;
-        let dict_bytes = zstd::decode_all(dict_compressed)?;
+        let dict_bytes = brotli_decompress(dict_compressed)?;
         let event_type_dict: Vec<String> = std::str::from_utf8(&dict_bytes)?
             .split('\n')
             .map(|s| s.to_string())
@@ -823,25 +875,25 @@ impl EventCodec for NatebrennandCodec {
         // 4. Event type indices (4-bit packed)
         let packed_compressed = &bytes[offset..offset + header.packed_compressed as usize];
         offset += header.packed_compressed as usize;
-        let packed_bytes = zstd::decode_all(packed_compressed)?;
+        let packed_bytes = brotli_decompress(packed_compressed)?;
         let num_events = header.num_events as usize;
         let event_type_indices = unpack_nibbles(&packed_bytes, num_events);
 
         // 5. Event ID deltas (varint encoded)
         let id_deltas_compressed = &bytes[offset..offset + header.id_deltas_compressed as usize];
         offset += header.id_deltas_compressed as usize;
-        let id_deltas_varint = zstd::decode_all(id_deltas_compressed)?;
+        let id_deltas_varint = brotli_decompress(id_deltas_compressed)?;
         let event_id_deltas = decode_varint_u64(&id_deltas_varint, num_events);
 
         // 6. Repo pair indices (24-bit packed)
         let repo_compressed = &bytes[offset..offset + header.repo_compressed as usize];
         offset += header.repo_compressed as usize;
-        let repo_bytes = zstd::decode_all(repo_compressed)?;
+        let repo_bytes = brotli_decompress(repo_compressed)?;
         let repo_pair_indices = unpack_u24(&repo_bytes, num_events);
 
         // 7. Created at deltas (varint encoded)
         let ts_compressed = &bytes[offset..offset + header.ts_compressed as usize];
-        let ts_bytes = zstd::decode_all(ts_compressed)?;
+        let ts_bytes = brotli_decompress(ts_compressed)?;
         let created_at_deltas = decode_varint_i16(&ts_bytes, num_events);
 
         // Decode events
