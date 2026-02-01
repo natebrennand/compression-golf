@@ -414,16 +414,13 @@ fn unpack_nibbles(packed: &[u8], count: usize) -> Vec<u8> {
 fn build_mapping_table(
     events: &[(EventKey, EventValue)],
 ) -> (Vec<u8>, Vec<u8>, HashMap<(u32, String), u32>) {
-    // Collect unique (repo_id, repo_name) pairs
-    let mut unique_pairs: Vec<(u32, String)> = events
+    // Collect unique (repo_id, repo_name) pairs, sorted for determinism
+    let unique_pairs: Vec<(u32, String)> = events
         .iter()
         .map(|(_, v)| (v.repo.id as u32, v.repo.name.clone()))
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-
-    // Sort by repo_id for optimal delta encoding
-    unique_pairs.sort_by_key(|(id, _)| *id);
 
     // Build index mapping and collect data
     let mut pair_to_idx: HashMap<(u32, String), u32> = HashMap::new();
@@ -546,14 +543,13 @@ fn restore_i64_from_deltas(first: i64, deltas: &[i16]) -> Vec<i64> {
 
 /// Build dictionary encoding for event types
 fn build_event_type_dict(event_types: &[&str]) -> (Vec<u8>, Vec<u8>, HashMap<String, u8>) {
-    // Collect unique event types and sort for deterministic ordering
-    let mut unique_types: Vec<String> = event_types
+    // Collect unique event types with deterministic ordering (BTreeSet)
+    let unique_types: Vec<String> = event_types
         .iter()
         .map(|s| s.to_string())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    unique_types.sort();
 
     // Build dictionary: newline-separated strings
     let dict_str = unique_types.join("\n");
